@@ -1,278 +1,305 @@
 'use client';
 
 import Link from 'next/link';
-import { useState, useEffect, useRef } from 'react';
-import { loadModel, detectObjects, type Detection } from '@/lib/yolo';
+import { useEffect, useRef, useState } from 'react';
+import { detectObjects, loadModel, type Detection } from '@/lib/yolo';
+
+type ModelStatus = '載入中' | '已就緒' | '載入失敗';
 
 export default function CameraPage() {
   const [isRunning, setIsRunning] = useState(false);
   const [isModelLoaded, setIsModelLoaded] = useState(false);
   const [isDetecting, setIsDetecting] = useState(false);
   const [detections, setDetections] = useState<Detection[]>([]);
-  const [modelStatus, setModelStatus] = useState('未加載');
-  
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const animationFrameRef = useRef<number | undefined>(undefined);
+  const [modelStatus, setModelStatus] = useState<ModelStatus>('載入中');
+  const [detectorFps, setDetectorFps] = useState(0);
+  const [errorMessage, setErrorMessage] = useState('');
 
-  // 初始化模型
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  const runningRef = useRef(false);
+  const mountedRef = useRef(true);
+  const fpsWindowRef = useRef({ startedAt: 0, frames: 0 });
+
   useEffect(() => {
-    const initModel = async () => {
-      try {
-        setModelStatus('正在加載...');
-        await loadModel();
+    mountedRef.current = true;
+    loadModel()
+      .then(() => {
+        if (!mountedRef.current) return;
         setIsModelLoaded(true);
-        setModelStatus('已準備');
-      } catch (error) {
-        console.error('模型初始化失敗:', error);
-        setModelStatus('加載失敗');
-      }
-    };
+        setModelStatus('已就緒');
+      })
+      .catch((error) => {
+        console.error('模型載入失敗：', error);
+        if (!mountedRef.current) return;
+        setModelStatus('載入失敗');
+        setErrorMessage('無法載入 YOLO 模型，請重新整理頁面後再試。');
+      });
 
-    initModel();
+    return () => {
+      mountedRef.current = false;
+      runningRef.current = false;
+      if (animationFrameRef.current !== null) cancelAnimationFrame(animationFrameRef.current);
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+    };
   }, []);
 
-  const startCamera = async () => {
-    // 確保模型已加載
-    if (!isModelLoaded) {
-      setModelStatus('正在加載模型...');
-      try {
-        await loadModel();
-        setIsModelLoaded(true);
-        setModelStatus('已準備');
-      } catch (error) {
-        console.error('模型加載失敗:', error);
-        setModelStatus('模型加載失敗');
-        alert('無法加載 YOLO 模型。請檢查網路連接並重新嘗試。');
-        return;
-      }
+  const ensureModelLoaded = async () => {
+    if (isModelLoaded) return true;
+    setModelStatus('載入中');
+    setErrorMessage('');
+    try {
+      await loadModel();
+      setIsModelLoaded(true);
+      setModelStatus('已就緒');
+      return true;
+    } catch (error) {
+      console.error('模型載入失敗：', error);
+      setModelStatus('載入失敗');
+      setErrorMessage('無法載入 YOLO 模型，請確認模型檔案存在。');
+      return false;
     }
+  };
 
+  const startCamera = async () => {
+    if (!(await ensureModelLoaded())) return;
+
+    setErrorMessage('');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' }
+        audio: false,
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 30, max: 60 },
+        },
       });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        setIsRunning(true);
-        
-        // 視頻準備好後開始檢測
-        videoRef.current.onloadedmetadata = () => {
-          // 使用 setTimeout 確保狀態已更新
-          setTimeout(() => {
-            startDetectionLoop();
-          }, 100);
-        };
+
+      const video = videoRef.current;
+      if (!video) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
       }
+
+      streamRef.current = stream;
+      video.srcObject = stream;
+      if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
+        await new Promise<void>((resolve) => {
+          video.addEventListener('loadedmetadata', () => resolve(), { once: true });
+        });
+      }
+      await video.play();
+
+      const overlay = overlayRef.current;
+      if (overlay) {
+        overlay.width = video.videoWidth;
+        overlay.height = video.videoHeight;
+      }
+
+      runningRef.current = true;
+      fpsWindowRef.current = { startedAt: 0, frames: 0 };
+      setIsRunning(true);
+      setIsDetecting(true);
+      startDetectionLoop();
     } catch (error) {
-      console.error('相機訪問錯誤:', error);
-      alert('無法訪問相機。請檢查權限設置。');
+      console.error('無法啟動相機：', error);
+      setErrorMessage('無法開啟相機。請允許相機權限，並確認目前使用 HTTPS 或 localhost。');
     }
   };
 
   const startDetectionLoop = () => {
-    const detect = async () => {
-      if (!videoRef.current || !canvasRef.current) {
-        return;
-      }
-
-      // 檢查視頻流是否仍在運行
-      if (!videoRef.current.srcObject) {
-        return;
-      }
-
+    const detectFrame = async () => {
       const video = videoRef.current;
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext('2d');
+      const overlay = overlayRef.current;
+      if (!runningRef.current || !video || !overlay) return;
 
-      if (!ctx) return;
+      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+        try {
+          if (overlay.width !== video.videoWidth || overlay.height !== video.videoHeight) {
+            overlay.width = video.videoWidth;
+            overlay.height = video.videoHeight;
+          }
 
-      try {
-        // 設置 canvas 大小
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-
-        // 繪製視頻幀
-        ctx.drawImage(video, 0, 0);
-
-        // 執行檢測
-        setIsDetecting(true);
-        const results = await detectObjects(canvas, 0.45);
-        setDetections(results);
-        setIsDetecting(false);
-
-        // 繪製檢測框
-        drawDetections(ctx, results, canvas.width, canvas.height);
-      } catch (error) {
-        console.error('檢測循環錯誤:', error);
+          const results = await detectObjects(video, 0.3);
+          if (!runningRef.current || !mountedRef.current) return;
+          drawDetections(overlay, results);
+          setDetections(results);
+          updateFps();
+        } catch (error) {
+          console.error('物件辨識失敗：', error);
+          if (mountedRef.current) setErrorMessage('推論時發生錯誤，請停止相機後再重新啟動。');
+        }
       }
 
-      // 繼續檢測
-      if (videoRef.current && videoRef.current.srcObject) {
-        animationFrameRef.current = requestAnimationFrame(detect);
-      }
+      if (runningRef.current) animationFrameRef.current = requestAnimationFrame(detectFrame);
     };
 
-    detect();
+    animationFrameRef.current = requestAnimationFrame(detectFrame);
   };
 
-  const stopCamera = () => {
-    if (videoRef.current && videoRef.current.srcObject) {
-      const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
-      tracks.forEach(track => track.stop());
-      setIsRunning(false);
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
-      }
+  const updateFps = () => {
+    const now = performance.now();
+    const fpsWindow = fpsWindowRef.current;
+    if (fpsWindow.startedAt === 0) {
+      fpsWindowRef.current = { startedAt: now, frames: 1 };
+      return;
+    }
+    fpsWindow.frames += 1;
+    const elapsed = now - fpsWindow.startedAt;
+    if (elapsed >= 750) {
+      setDetectorFps((fpsWindow.frames * 1000) / elapsed);
+      fpsWindowRef.current = { startedAt: now, frames: 0 };
     }
   };
 
-  const drawDetections = (
-    ctx: CanvasRenderingContext2D,
-    detections: Detection[],
-    canvasWidth: number,
-    canvasHeight: number
-  ) => {
-    detections.forEach(det => {
-      // 繪製邊界框
-      ctx.strokeStyle = '#00ff00';
-      ctx.lineWidth = 3;
-      ctx.strokeRect(det.x, det.y, det.width, det.height);
-
-      // 繪製標籤背景
-      const label = `${det.class_name} (${(det.confidence * 100).toFixed(1)}%)`;
-      const fontSize = 16;
-      ctx.font = `${fontSize}px Arial`;
-      const textWidth = ctx.measureText(label).width;
-
-      ctx.fillStyle = '#00ff00';
-      ctx.fillRect(det.x, det.y - fontSize - 4, textWidth + 4, fontSize + 4);
-
-      // 繪製標籤文字
-      ctx.fillStyle = '#000000';
-      ctx.fillText(label, det.x + 2, det.y - 4);
-    });
+  const stopCamera = () => {
+    runningRef.current = false;
+    if (animationFrameRef.current !== null) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+    const overlay = overlayRef.current;
+    if (overlay) overlay.getContext('2d')?.clearRect(0, 0, overlay.width, overlay.height);
+    setIsRunning(false);
+    setIsDetecting(false);
+    setDetections([]);
+    setDetectorFps(0);
   };
 
   return (
-    <div className="min-h-screen bg-slate-900 text-white">
-      <div className="max-w-4xl mx-auto px-4 py-8">
-        {/* 返回按鈕 */}
-        <div className="mb-6">
-          <Link href="/" className="inline-flex items-center gap-2 text-blue-400 hover:text-blue-300">
-            ← 返回主頁
-          </Link>
-        </div>
+    <main className="min-h-screen bg-slate-950 text-white">
+      <div className="mx-auto max-w-[1600px] px-3 py-4 sm:px-6 sm:py-6">
+        <header className="mb-4 flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <Link href="/" className="mb-2 inline-block text-sm text-sky-400 hover:text-sky-300">
+              ← 返回首頁
+            </Link>
+            <h1 className="text-2xl font-bold sm:text-3xl">即時物件辨識</h1>
+          </div>
+          <div className="flex flex-wrap gap-2 text-sm">
+            <StatusPill label="模型" value={modelStatus} good={modelStatus === '已就緒'} />
+            <StatusPill label="辨識 FPS" value={detectorFps ? detectorFps.toFixed(1) : '—'} good={detectorFps > 0} />
+            <StatusPill label="物件" value={String(detections.length)} good={detections.length > 0} />
+          </div>
+        </header>
 
-        {/* 標題和狀態 */}
-        <div className="mb-8">
-          <h1 className="text-3xl font-bold mb-4">📷 實時相機模式</h1>
-          <div className="grid grid-cols-2 gap-4 text-sm">
-            <div className="p-3 bg-slate-800 rounded">
-              <p className="text-slate-400">相機狀態</p>
-              <p className="font-semibold">{isRunning ? '✓ 已啟動' : '待機中'}</p>
-            </div>
-            <div className="p-3 bg-slate-800 rounded">
-              <p className="text-slate-400">模型狀態</p>
-              <p className="font-semibold">{modelStatus}</p>
+        <section className="relative min-h-[52vh] overflow-hidden rounded-2xl border border-slate-700 bg-black shadow-2xl sm:min-h-[68vh]">
+          <div className="absolute inset-0 flex items-center justify-center">
+            <div className="relative max-h-full max-w-full">
+              <video
+                ref={videoRef}
+                autoPlay
+                muted
+                playsInline
+                className="block max-h-[78vh] min-h-[52vh] max-w-full object-contain sm:min-h-[68vh]"
+              />
+              <canvas
+                ref={overlayRef}
+                className="pointer-events-none absolute inset-0 h-full w-full"
+              />
             </div>
           </div>
-        </div>
 
-        {/* 隱藏的視頻元素 */}
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          className="hidden"
-        />
-
-        {/* Canvas（顯示檢測結果） */}
-        <div className="relative bg-black rounded-lg overflow-hidden shadow-xl mb-8">
-          <canvas
-            ref={canvasRef}
-            className="w-full aspect-video bg-black"
-          />
           {!isRunning && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/50 pointer-events-none">
-              <p className="text-slate-300">點擊下方按鈕啟動相機</p>
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-slate-950/85 px-6 text-center">
+              <div className="text-5xl">📷</div>
+              <p className="text-lg font-medium text-slate-200">
+                {modelStatus === '載入中' ? '正在載入辨識模型…' : '啟動相機以開始即時辨識'}
+              </p>
+              <p className="max-w-md text-sm text-slate-400">相機預覽會維持原生更新率；右上角顯示的是 AI 辨識速度。</p>
             </div>
           )}
-        </div>
+        </section>
 
-        {/* 控制按鈕 */}
-        <div className="flex gap-4 justify-center mb-8">
+        {errorMessage && (
+          <div className="mt-4 rounded-lg border border-red-700 bg-red-950/60 px-4 py-3 text-sm text-red-200">
+            {errorMessage}
+          </div>
+        )}
+
+        <div className="mt-5 flex justify-center">
           {!isRunning ? (
             <button
               type="button"
               onClick={startCamera}
-              className="px-8 py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition-colors cursor-pointer"
+              disabled={modelStatus === '載入中'}
+              className="min-w-48 rounded-xl bg-sky-600 px-8 py-3 font-semibold transition hover:bg-sky-500 disabled:cursor-wait disabled:bg-slate-700"
             >
-              📷 打開相機
+              {modelStatus === '載入中' ? '模型載入中…' : '啟動相機'}
             </button>
           ) : (
             <button
               type="button"
               onClick={stopCamera}
-              className="px-8 py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg transition-colors cursor-pointer"
+              className="min-w-48 rounded-xl bg-red-600 px-8 py-3 font-semibold transition hover:bg-red-500"
             >
-              ⏹️ 關閉相機
+              停止相機
             </button>
           )}
         </div>
 
-        {/* 檢測結果統計 */}
         {isRunning && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {/* 檢測統計 */}
-            <div className="p-4 bg-slate-800 border border-slate-700 rounded-lg">
-              <p className="text-slate-400 text-sm mb-2">檢測到的物體</p>
-              <p className="text-2xl font-bold">{detections.length}</p>
-              {isDetecting && <p className="text-yellow-400 text-sm mt-2">⚙️ 正在檢測中...</p>}
+          <section className="mt-5 rounded-xl border border-slate-800 bg-slate-900/70 p-4">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="font-semibold">辨識結果</h2>
+              {isDetecting && <span className="text-xs text-emerald-400">● 持續辨識中</span>}
             </div>
-
-            {/* 檢測到的物體列表 */}
-            <div className="p-4 bg-slate-800 border border-slate-700 rounded-lg">
-              <p className="text-slate-400 text-sm mb-3">檢測結果</p>
-              <div className="max-h-48 overflow-y-auto space-y-1 text-sm">
-                {detections.slice(0, 5).map((det, idx) => (
-                  <div key={idx} className="text-slate-300">
-                    • {det.class_name} ({(det.confidence * 100).toFixed(1)}%)
-                  </div>
+            {detections.length ? (
+              <div className="flex flex-wrap gap-2">
+                {detections.map((detection, index) => (
+                  <span key={`${detection.class_id}-${index}`} className="rounded-full bg-slate-800 px-3 py-1 text-sm text-slate-200">
+                    {detection.class_name} {(detection.confidence * 100).toFixed(0)}%
+                  </span>
                 ))}
-                {detections.length > 5 && (
-                  <div className="text-slate-500">... 及其他 {detections.length - 5} 項</div>
-                )}
               </div>
-            </div>
-          </div>
-        )}
-
-        {/* 信息提示 */}
-        {modelStatus === '加載失敗' && (
-          <div className="mt-8 p-4 bg-red-900/30 border border-red-600 rounded-lg">
-            <p className="text-red-300">
-              ❌ 模型加載失敗。請檢查網路連接並點擊按鈕重試。
-            </p>
-          </div>
-        )}
-        
-        {modelStatus === '正在加載...' && (
-          <div className="mt-8 p-4 bg-blue-900/30 border border-blue-600 rounded-lg">
-            <p className="text-blue-300">
-              ⏳ 模型正在加載中... 請稍候（首次加載可能需要 10-30 秒）
-            </p>
-          </div>
-        )}
-
-        {!isRunning && modelStatus === '已準備' && (
-          <div className="mt-8 p-4 bg-green-900/30 border border-green-600 rounded-lg">
-            <p className="text-green-300">
-              ✓ 模型已準備！點擊上方按鈕即可打開相機進行實時檢測。
-            </p>
-          </div>
+            ) : (
+              <p className="text-sm text-slate-400">目前畫面中尚未找到信心度 30% 以上的物件。</p>
+            )}
+          </section>
         )}
       </div>
+    </main>
+  );
+}
+
+function StatusPill({ label, value, good }: { label: string; value: string; good: boolean }) {
+  return (
+    <div className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2">
+      <span className="mr-2 text-slate-400">{label}</span>
+      <span className={good ? 'font-semibold text-emerald-400' : 'font-semibold text-slate-200'}>{value}</span>
     </div>
   );
+}
+
+function drawDetections(canvas: HTMLCanvasElement, detections: Detection[]) {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const scale = Math.max(1, canvas.width / 1280);
+  const lineWidth = 3 * scale;
+  const fontSize = Math.round(16 * scale);
+  ctx.font = `600 ${fontSize}px Arial, sans-serif`;
+  ctx.textBaseline = 'top';
+
+  for (const detection of detections) {
+    const label = `${detection.class_name} ${(detection.confidence * 100).toFixed(0)}%`;
+    const labelHeight = fontSize + 10 * scale;
+    const labelWidth = ctx.measureText(label).width + 12 * scale;
+    const labelY = detection.y >= labelHeight ? detection.y - labelHeight : detection.y;
+
+    ctx.strokeStyle = '#22c55e';
+    ctx.lineWidth = lineWidth;
+    ctx.strokeRect(detection.x, detection.y, detection.width, detection.height);
+    ctx.fillStyle = '#22c55e';
+    ctx.fillRect(detection.x, labelY, labelWidth, labelHeight);
+    ctx.fillStyle = '#04130a';
+    ctx.fillText(label, detection.x + 6 * scale, labelY + 5 * scale);
+  }
 }

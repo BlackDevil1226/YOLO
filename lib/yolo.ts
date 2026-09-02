@@ -1,18 +1,23 @@
-import * as ort from 'onnxruntime-web';
+import type { InferenceSession, Tensor } from 'onnxruntime-web';
 
-// YOLO11n 模型輸出的類別標籤
+const MODEL_SIZE = 640;
+const MODEL_PATH = '/models/yolo11n.onnx';
+const MAX_CANDIDATES_BEFORE_NMS = 300;
+const IOU_THRESHOLD = 0.45;
+
 export const YOLO_CLASSES = [
-  'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 
-  'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 
-  'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 
-  'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 
-  'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard', 
-  'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 'knife', 
-  'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 
-  'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed', 
-  'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'microwave', 
-  'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 
-  'teddy bear', 'hair drier', 'toothbrush'
+  'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck',
+  'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench',
+  'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra',
+  'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+  'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
+  'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup',
+  'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+  'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
+  'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
+  'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+  'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
+  'toothbrush',
 ];
 
 export interface Detection {
@@ -25,204 +30,204 @@ export interface Detection {
   height: number;
 }
 
-let model: ort.InferenceSession | null = null;
+type ImageSource = HTMLCanvasElement | HTMLVideoElement | HTMLImageElement;
 
-// 加載模型
+let ortRuntime: typeof import('onnxruntime-web') | null = null;
+let model: InferenceSession | null = null;
+let modelPromise: Promise<void> | null = null;
+let preprocessingCanvas: HTMLCanvasElement | null = null;
+let inputBuffer: Float32Array | null = null;
+
 export async function loadModel(): Promise<void> {
-  if (model) return; // 已加載
+  if (model) return;
+  if (modelPromise) return modelPromise;
 
-  try {
-    console.log('正在加載 YOLO 模型...');
-    
-    // 設置 ONNX Runtime 以使用 WebGPU（如可用）或 WebAssembly 後備
-    const wasmEnv = ort.env.wasm as any;
-    wasmEnv.simdSupported = true;
-    wasmEnv.numThreads = 4;
-    
-    // 嘗試使用 WebGPU，後備到 WebAssembly
-    const executionProviders: any[] = [];
-    
-    // 檢查 WebGPU 支援
-    if (typeof navigator !== 'undefined' && 'gpu' in navigator) {
-      console.log('✓ 檢測到 WebGPU 支援，嘗試使用 WebGPU...');
-      executionProviders.push('webgpu');
-    } else {
-      console.log('ℹ️ 未支持 WebGPU，將使用 WebAssembly');
-    }
-    
-    // 添加 WebAssembly 作為後備
-    executionProviders.push('wasm');
-    
-    model = await ort.InferenceSession.create('/models/yolo11n.onnx', {
+  modelPromise = (async () => {
+    // Loading this bundle during SSR makes its browser-relative WASM URL invalid.
+    // loadModel is called from a client effect, so keep the runtime browser-only.
+    const ort = (ortRuntime ??= await import('onnxruntime-web/webgpu'));
+    // Multi-threaded WASM needs cross-origin isolation. WebGPU remains the fast path.
+    ort.env.wasm.numThreads = globalThis.crossOriginIsolated
+      ? Math.min(navigator.hardwareConcurrency || 4, 4)
+      : 1;
+
+    const executionProviders: InferenceSession.ExecutionProviderConfig[] =
+      'gpu' in navigator ? ['webgpu', 'wasm'] : ['wasm'];
+
+    model = await ort.InferenceSession.create(MODEL_PATH, {
       executionProviders,
       graphOptimizationLevel: 'all',
+      enableCpuMemArena: true,
+      enableMemPattern: true,
     });
-    
-    console.log('✓ 模型已加載');
+  })();
+
+  try {
+    await modelPromise;
   } catch (error) {
-    console.error('模型加載失敗:', error);
+    model = null;
+    modelPromise = null;
     throw error;
   }
 }
 
-// 前處理：將圖像準備為模型輸入
-function preprocessImage(
-  canvas: HTMLCanvasElement,
-  targetSize: number = 640
-): {
-  data: Float32Array;
-  originalWidth: number;
-  originalHeight: number;
-  scale: number;
-} {
-  const ctx = canvas.getContext('2d')!;
-  const originalWidth = canvas.width;
-  const originalHeight = canvas.height;
-
-  // 計算縮放比例（保持比例）
-  const scale = Math.min(targetSize / originalWidth, targetSize / originalHeight);
-  
-  // 創建臨時 canvas 用於縮放
-  const tempCanvas = document.createElement('canvas');
-  tempCanvas.width = targetSize;
-  tempCanvas.height = targetSize;
-  const tempCtx = tempCanvas.getContext('2d')!;
-  
-  // 填充背景（灰色）
-  tempCtx.fillStyle = '#128';
-  tempCtx.fillRect(0, 0, targetSize, targetSize);
-  
-  // 計算偏移以居中圖像
-  const offsetX = (targetSize - originalWidth * scale) / 2;
-  const offsetY = (targetSize - originalHeight * scale) / 2;
-  
-  // 繪製縮放後的圖像
-  tempCtx.drawImage(
-    canvas,
-    0, 0, originalWidth, originalHeight,
-    offsetX, offsetY, originalWidth * scale, originalHeight * scale
-  );
-  
-  // 提取像素數據
-  const imageData = tempCtx.getImageData(0, 0, targetSize, targetSize);
-  const data = imageData.data;
-  
-  // 轉換為 Float32Array 並進行標準化
-  const float32Data = new Float32Array(3 * targetSize * targetSize);
-  
-  for (let i = 0; i < data.length; i += 4) {
-    float32Data[i / 4] = data[i] / 255; // R
-    float32Data[targetSize * targetSize + i / 4] = data[i + 1] / 255; // G
-    float32Data[2 * targetSize * targetSize + i / 4] = data[i + 2] / 255; // B
+function getSourceSize(source: ImageSource) {
+  if (source instanceof HTMLVideoElement) {
+    return { width: source.videoWidth, height: source.videoHeight };
   }
-  
-  return {
-    data: float32Data,
-    originalWidth,
-    originalHeight,
-    scale,
-  };
+  if (source instanceof HTMLImageElement) {
+    return { width: source.naturalWidth, height: source.naturalHeight };
+  }
+  return { width: source.width, height: source.height };
 }
 
-// 執行推理
+function preprocessImage(source: ImageSource) {
+  const { width: originalWidth, height: originalHeight } = getSourceSize(source);
+  if (!originalWidth || !originalHeight) {
+    throw new Error('影像尚未準備完成');
+  }
+
+  if (!preprocessingCanvas) {
+    preprocessingCanvas = document.createElement('canvas');
+    preprocessingCanvas.width = MODEL_SIZE;
+    preprocessingCanvas.height = MODEL_SIZE;
+  }
+
+  const ctx = preprocessingCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) throw new Error('無法建立影像處理畫布');
+
+  const scale = Math.min(MODEL_SIZE / originalWidth, MODEL_SIZE / originalHeight);
+  const scaledWidth = Math.round(originalWidth * scale);
+  const scaledHeight = Math.round(originalHeight * scale);
+  const offsetX = (MODEL_SIZE - scaledWidth) / 2;
+  const offsetY = (MODEL_SIZE - scaledHeight) / 2;
+
+  // Ultralytics letterbox uses RGB(114, 114, 114), not a blue CSS hex colour.
+  ctx.fillStyle = 'rgb(114, 114, 114)';
+  ctx.fillRect(0, 0, MODEL_SIZE, MODEL_SIZE);
+  ctx.drawImage(source, offsetX, offsetY, scaledWidth, scaledHeight);
+
+  const rgba = ctx.getImageData(0, 0, MODEL_SIZE, MODEL_SIZE).data;
+  inputBuffer ??= new Float32Array(3 * MODEL_SIZE * MODEL_SIZE);
+  const planeSize = MODEL_SIZE * MODEL_SIZE;
+
+  for (let pixel = 0, rgbaIndex = 0; pixel < planeSize; pixel++, rgbaIndex += 4) {
+    inputBuffer[pixel] = rgba[rgbaIndex] / 255;
+    inputBuffer[planeSize + pixel] = rgba[rgbaIndex + 1] / 255;
+    inputBuffer[2 * planeSize + pixel] = rgba[rgbaIndex + 2] / 255;
+  }
+
+  return { data: inputBuffer, originalWidth, originalHeight, scale, offsetX, offsetY };
+}
+
 export async function detectObjects(
-  canvas: HTMLCanvasElement,
-  confidenceThreshold: number = 0.5
+  source: ImageSource,
+  confidenceThreshold = 0.3,
 ): Promise<Detection[]> {
-  if (!model) {
-    await loadModel();
-  }
+  if (!model) await loadModel();
 
-  try {
-    // 前處理
-    const { data, originalWidth, originalHeight, scale } = preprocessImage(canvas);
-    
-    // 創建輸入張量
-    const inputTensor = new ort.Tensor('float32', data, [1, 3, 640, 640]);
-    
-    // 運行推理
-    const outputs = await model!.run({ images: inputTensor });
-    
-    // 後處理
-    const detections = postprocessOutput(
-      outputs,
-      originalWidth,
-      originalHeight,
-      scale,
-      confidenceThreshold
-    );
-    
-    return detections;
-  } catch (error) {
-    console.error('檢測失敗:', error);
-    return [];
-  }
+  const preprocessing = preprocessImage(source);
+  const ort = ortRuntime!;
+  const inputTensor = new ort.Tensor('float32', preprocessing.data, [1, 3, MODEL_SIZE, MODEL_SIZE]);
+  const outputs = await model!.run({ images: inputTensor });
+  const output = outputs[model!.outputNames[0]];
+
+  return postprocessOutput(output, preprocessing, confidenceThreshold);
 }
 
-// 後處理：解析模型輸出
 function postprocessOutput(
-  outputs: Record<string, ort.Tensor>,
-  originalWidth: number,
-  originalHeight: number,
-  scale: number,
-  confidenceThreshold: number
-): Detection[] {
-  const detections: Detection[] = [];
-  
-  // YOLO11 的輸出格式：[batch, 84, 8400]
-  // 前 4 個值是邊界框坐標，接下來是置信度和類別概率
-  const output = outputs['output0'];
-  
-  if (!output.data || typeof output.data === 'string') {
-    console.error('輸出數據格式不正確');
-    return [];
+  output: Tensor,
+  dimensions: {
+    originalWidth: number;
+    originalHeight: number;
+    scale: number;
+    offsetX: number;
+    offsetY: number;
+  },
+  confidenceThreshold: number,
+) {
+  if (!output || typeof output.data === 'string' || output.dims.length !== 3) {
+    throw new Error('模型輸出格式不正確');
   }
-  
-  const outputData = output.data as Float32Array;
-  const modelInputSize = 640;
-  const offsetX = (modelInputSize - originalWidth * scale) / 2;
-  const offsetY = (modelInputSize - originalHeight * scale) / 2;
-  
-  // 遍歷所有檢測
-  for (let i = 0; i < 8400; i++) {
-    const confidence = outputData[4 * 8400 + i];
-    
-    if (confidence > confidenceThreshold) {
-      // 提取邊界框坐標
-      const centerX = outputData[0 * 8400 + i];
-      const centerY = outputData[1 * 8400 + i];
-      const width = outputData[2 * 8400 + i];
-      const height = outputData[3 * 8400 + i];
-      
-      // 找到最高的類別概率
-      let maxClassProb = 0;
-      let maxClassId = 0;
-      
-      for (let classId = 0; classId < YOLO_CLASSES.length; classId++) {
-        const classProb = outputData[(5 + classId) * 8400 + i];
-        if (classProb > maxClassProb) {
-          maxClassProb = classProb;
-          maxClassId = classId;
-        }
+
+  const data = output.data as Float32Array;
+  const rowsFirst = output.dims[1] <= output.dims[2];
+  const attributeCount = Number(rowsFirst ? output.dims[1] : output.dims[2]);
+  const predictionCount = Number(rowsFirst ? output.dims[2] : output.dims[1]);
+  const classCount = Math.min(attributeCount - 4, YOLO_CLASSES.length);
+
+  if (classCount <= 0) throw new Error(`不支援的模型輸出形狀：${output.dims.join(' × ')}`);
+
+  const valueAt = rowsFirst
+    ? (prediction: number, attribute: number) => data[attribute * predictionCount + prediction]
+    : (prediction: number, attribute: number) => data[prediction * attributeCount + attribute];
+
+  const candidates: Detection[] = [];
+  const { originalWidth, originalHeight, scale, offsetX, offsetY } = dimensions;
+
+  for (let prediction = 0; prediction < predictionCount; prediction++) {
+    // YOLO11 output is [x, y, w, h, class0 ... class79]. It has no objectness row.
+    let classId = 0;
+    let confidence = valueAt(prediction, 4);
+    for (let classIndex = 1; classIndex < classCount; classIndex++) {
+      const probability = valueAt(prediction, 4 + classIndex);
+      if (probability > confidence) {
+        confidence = probability;
+        classId = classIndex;
       }
-      
-      // 將坐標從模型空間轉換回原始圖像空間
-      const x = (centerX - offsetX) / scale;
-      const y = (centerY - offsetY) / scale;
-      const w = width / scale;
-      const h = height / scale;
-      
-      detections.push({
-        class_id: maxClassId,
-        class_name: YOLO_CLASSES[maxClassId],
-        confidence: confidence * maxClassProb,
-        x: Math.max(0, x - w / 2),
-        y: Math.max(0, y - h / 2),
-        width: w,
-        height: h,
-      });
     }
+
+    if (confidence < confidenceThreshold) continue;
+
+    const centerX = (valueAt(prediction, 0) - offsetX) / scale;
+    const centerY = (valueAt(prediction, 1) - offsetY) / scale;
+    const boxWidth = valueAt(prediction, 2) / scale;
+    const boxHeight = valueAt(prediction, 3) / scale;
+    const left = Math.max(0, centerX - boxWidth / 2);
+    const top = Math.max(0, centerY - boxHeight / 2);
+    const right = Math.min(originalWidth, centerX + boxWidth / 2);
+    const bottom = Math.min(originalHeight, centerY + boxHeight / 2);
+
+    if (right <= left || bottom <= top) continue;
+
+    candidates.push({
+      class_id: classId,
+      class_name: YOLO_CLASSES[classId],
+      confidence,
+      x: left,
+      y: top,
+      width: right - left,
+      height: bottom - top,
+    });
   }
-  
-  return detections;
+
+  candidates.sort((a, b) => b.confidence - a.confidence);
+  return nonMaximumSuppression(candidates.slice(0, MAX_CANDIDATES_BEFORE_NMS));
+}
+
+function nonMaximumSuppression(candidates: Detection[]) {
+  const selected: Detection[] = [];
+
+  for (const candidate of candidates) {
+    const overlapsSelectedBox = selected.some(
+      (selectedBox) =>
+        selectedBox.class_id === candidate.class_id &&
+        intersectionOverUnion(candidate, selectedBox) > IOU_THRESHOLD,
+    );
+    if (!overlapsSelectedBox) selected.push(candidate);
+  }
+
+  return selected;
+}
+
+function intersectionOverUnion(a: Detection, b: Detection) {
+  const intersectionLeft = Math.max(a.x, b.x);
+  const intersectionTop = Math.max(a.y, b.y);
+  const intersectionRight = Math.min(a.x + a.width, b.x + b.width);
+  const intersectionBottom = Math.min(a.y + a.height, b.y + b.height);
+  const intersectionWidth = Math.max(0, intersectionRight - intersectionLeft);
+  const intersectionHeight = Math.max(0, intersectionBottom - intersectionTop);
+  const intersectionArea = intersectionWidth * intersectionHeight;
+  const unionArea = a.width * a.height + b.width * b.height - intersectionArea;
+  return unionArea > 0 ? intersectionArea / unionArea : 0;
 }
