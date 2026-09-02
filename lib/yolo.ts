@@ -1,6 +1,6 @@
 import type { InferenceSession, Tensor } from 'onnxruntime-web';
 
-const MODEL_SIZE = 640;
+const DEFAULT_MODEL_SIZE = 640;
 const MODEL_PATH = '/models/yolo11n.onnx';
 const MAX_CANDIDATES_BEFORE_NMS = 300;
 const IOU_THRESHOLD = 0.45;
@@ -81,7 +81,7 @@ function getSourceSize(source: ImageSource) {
   return { width: source.width, height: source.height };
 }
 
-function preprocessImage(source: ImageSource) {
+function preprocessImage(source: ImageSource, inputSize: number) {
   const { width: originalWidth, height: originalHeight } = getSourceSize(source);
   if (!originalWidth || !originalHeight) {
     throw new Error('影像尚未準備完成');
@@ -89,27 +89,31 @@ function preprocessImage(source: ImageSource) {
 
   if (!preprocessingCanvas) {
     preprocessingCanvas = document.createElement('canvas');
-    preprocessingCanvas.width = MODEL_SIZE;
-    preprocessingCanvas.height = MODEL_SIZE;
+  }
+  if (preprocessingCanvas.width !== inputSize || preprocessingCanvas.height !== inputSize) {
+    preprocessingCanvas.width = inputSize;
+    preprocessingCanvas.height = inputSize;
   }
 
   const ctx = preprocessingCanvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) throw new Error('無法建立影像處理畫布');
 
-  const scale = Math.min(MODEL_SIZE / originalWidth, MODEL_SIZE / originalHeight);
+  const scale = Math.min(inputSize / originalWidth, inputSize / originalHeight);
   const scaledWidth = Math.round(originalWidth * scale);
   const scaledHeight = Math.round(originalHeight * scale);
-  const offsetX = (MODEL_SIZE - scaledWidth) / 2;
-  const offsetY = (MODEL_SIZE - scaledHeight) / 2;
+  const offsetX = (inputSize - scaledWidth) / 2;
+  const offsetY = (inputSize - scaledHeight) / 2;
 
   // Ultralytics letterbox uses RGB(114, 114, 114), not a blue CSS hex colour.
   ctx.fillStyle = 'rgb(114, 114, 114)';
-  ctx.fillRect(0, 0, MODEL_SIZE, MODEL_SIZE);
+  ctx.fillRect(0, 0, inputSize, inputSize);
   ctx.drawImage(source, offsetX, offsetY, scaledWidth, scaledHeight);
 
-  const rgba = ctx.getImageData(0, 0, MODEL_SIZE, MODEL_SIZE).data;
-  inputBuffer ??= new Float32Array(3 * MODEL_SIZE * MODEL_SIZE);
-  const planeSize = MODEL_SIZE * MODEL_SIZE;
+  const rgba = ctx.getImageData(0, 0, inputSize, inputSize).data;
+  const planeSize = inputSize * inputSize;
+  if (!inputBuffer || inputBuffer.length !== 3 * planeSize) {
+    inputBuffer = new Float32Array(3 * planeSize);
+  }
 
   for (let pixel = 0, rgbaIndex = 0; pixel < planeSize; pixel++, rgbaIndex += 4) {
     inputBuffer[pixel] = rgba[rgbaIndex] / 255;
@@ -123,12 +127,16 @@ function preprocessImage(source: ImageSource) {
 export async function detectObjects(
   source: ImageSource,
   confidenceThreshold = 0.3,
+  inputSize = DEFAULT_MODEL_SIZE,
 ): Promise<Detection[]> {
   if (!model) await loadModel();
+  if (inputSize < 320 || inputSize > 640 || inputSize % 32 !== 0) {
+    throw new Error('模型輸入尺寸必須是 320 至 640 之間的 32 倍數');
+  }
 
-  const preprocessing = preprocessImage(source);
+  const preprocessing = preprocessImage(source, inputSize);
   const ort = ortRuntime!;
-  const inputTensor = new ort.Tensor('float32', preprocessing.data, [1, 3, MODEL_SIZE, MODEL_SIZE]);
+  const inputTensor = new ort.Tensor('float32', preprocessing.data, [1, 3, inputSize, inputSize]);
   const outputs = await model!.run({ images: inputTensor });
   const output = outputs[model!.outputNames[0]];
 

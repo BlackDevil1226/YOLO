@@ -6,6 +6,9 @@ import { detectObjects, loadModel, type Detection } from '@/lib/yolo';
 
 type ModelStatus = '載入中' | '已就緒' | '載入失敗';
 
+const CAMERA_MODEL_SIZE = 416;
+const UI_UPDATE_INTERVAL_MS = 200;
+
 export default function CameraPage() {
   const [isRunning, setIsRunning] = useState(false);
   const [isModelLoaded, setIsModelLoaded] = useState(false);
@@ -18,10 +21,11 @@ export default function CameraPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
+  const detectionTimerRef = useRef<number | null>(null);
   const runningRef = useRef(false);
   const mountedRef = useRef(true);
   const fpsWindowRef = useRef({ startedAt: 0, frames: 0 });
+  const lastUiUpdateRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -41,7 +45,7 @@ export default function CameraPage() {
     return () => {
       mountedRef.current = false;
       runningRef.current = false;
-      if (animationFrameRef.current !== null) cancelAnimationFrame(animationFrameRef.current);
+      if (detectionTimerRef.current !== null) window.clearTimeout(detectionTimerRef.current);
       streamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
@@ -101,6 +105,7 @@ export default function CameraPage() {
 
       runningRef.current = true;
       fpsWindowRef.current = { startedAt: 0, frames: 0 };
+      lastUiUpdateRef.current = 0;
       setIsRunning(true);
       setIsDetecting(true);
       startDetectionLoop();
@@ -123,25 +128,28 @@ export default function CameraPage() {
             overlay.height = video.videoHeight;
           }
 
-          const results = await detectObjects(video, 0.3);
+          const results = await detectObjects(video, 0.3, CAMERA_MODEL_SIZE);
           if (!runningRef.current || !mountedRef.current) return;
           drawDetections(overlay, results);
-          setDetections(results);
-          updateFps();
+          const now = performance.now();
+          if (now - lastUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS) {
+            setDetections(results);
+            lastUiUpdateRef.current = now;
+          }
+          updateFps(now);
         } catch (error) {
           console.error('物件辨識失敗：', error);
           if (mountedRef.current) setErrorMessage('推論時發生錯誤，請停止相機後再重新啟動。');
         }
       }
 
-      if (runningRef.current) animationFrameRef.current = requestAnimationFrame(detectFrame);
+      if (runningRef.current) detectionTimerRef.current = window.setTimeout(detectFrame, 0);
     };
 
-    animationFrameRef.current = requestAnimationFrame(detectFrame);
+    detectionTimerRef.current = window.setTimeout(detectFrame, 0);
   };
 
-  const updateFps = () => {
-    const now = performance.now();
+  const updateFps = (now: number) => {
     const fpsWindow = fpsWindowRef.current;
     if (fpsWindow.startedAt === 0) {
       fpsWindowRef.current = { startedAt: now, frames: 1 };
@@ -157,9 +165,9 @@ export default function CameraPage() {
 
   const stopCamera = () => {
     runningRef.current = false;
-    if (animationFrameRef.current !== null) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
+    if (detectionTimerRef.current !== null) {
+      window.clearTimeout(detectionTimerRef.current);
+      detectionTimerRef.current = null;
     }
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
@@ -189,19 +197,19 @@ export default function CameraPage() {
           </div>
         </header>
 
-        <section className="relative min-h-[52vh] overflow-hidden rounded-2xl border border-slate-700 bg-black shadow-2xl sm:min-h-[68vh]">
-          <div className="absolute inset-0 flex items-center justify-center">
-            <div className="relative max-h-full max-w-full">
+        <section className="relative flex min-h-[52vh] items-center justify-center overflow-hidden rounded-2xl border border-slate-700 bg-black shadow-2xl sm:min-h-[68vh]">
+          <div className="grid w-full place-items-center">
+            <div className="col-start-1 row-start-1 grid w-full">
               <video
                 ref={videoRef}
                 autoPlay
                 muted
                 playsInline
-                className="block max-h-[78vh] min-h-[52vh] max-w-full object-contain sm:min-h-[68vh]"
+                className="col-start-1 row-start-1 block h-auto w-full"
               />
               <canvas
                 ref={overlayRef}
-                className="pointer-events-none absolute inset-0 h-full w-full"
+                className="pointer-events-none col-start-1 row-start-1 block h-auto w-full"
               />
             </div>
           </div>
@@ -253,7 +261,15 @@ export default function CameraPage() {
             {detections.length ? (
               <div className="flex flex-wrap gap-2">
                 {detections.map((detection, index) => (
-                  <span key={`${detection.class_id}-${index}`} className="rounded-full bg-slate-800 px-3 py-1 text-sm text-slate-200">
+                  <span
+                    key={`${detection.class_id}-${index}`}
+                    className="rounded-full border px-3 py-1 text-sm"
+                    style={{
+                      borderColor: getClassColor(detection.class_id),
+                      backgroundColor: getClassColor(detection.class_id, 0.14),
+                      color: getClassColor(detection.class_id),
+                    }}
+                  >
                     {detection.class_name} {(detection.confidence * 100).toFixed(0)}%
                   </span>
                 ))}
@@ -294,12 +310,19 @@ function drawDetections(canvas: HTMLCanvasElement, detections: Detection[]) {
     const labelWidth = ctx.measureText(label).width + 12 * scale;
     const labelY = detection.y >= labelHeight ? detection.y - labelHeight : detection.y;
 
-    ctx.strokeStyle = '#22c55e';
+    const color = getClassColor(detection.class_id);
+    ctx.strokeStyle = color;
     ctx.lineWidth = lineWidth;
     ctx.strokeRect(detection.x, detection.y, detection.width, detection.height);
-    ctx.fillStyle = '#22c55e';
+    ctx.fillStyle = color;
     ctx.fillRect(detection.x, labelY, labelWidth, labelHeight);
     ctx.fillStyle = '#04130a';
     ctx.fillText(label, detection.x + 6 * scale, labelY + 5 * scale);
   }
+}
+
+function getClassColor(classId: number, alpha = 1) {
+  // The golden-angle step keeps all 80 COCO classes deterministic and visually separated.
+  const hue = (classId * 137.508) % 360;
+  return `hsla(${hue}, 85%, 60%, ${alpha})`;
 }
