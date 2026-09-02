@@ -33,6 +33,21 @@ export default function CameraPage() {
   }, []);
 
   const startCamera = async () => {
+    // 確保模型已加載
+    if (!isModelLoaded) {
+      setModelStatus('正在加載模型...');
+      try {
+        await loadModel();
+        setIsModelLoaded(true);
+        setModelStatus('已準備');
+      } catch (error) {
+        console.error('模型加載失敗:', error);
+        setModelStatus('模型加載失敗');
+        alert('無法加載 YOLO 模型。請檢查網路連接並重新嘗試。');
+        return;
+      }
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'environment' }
@@ -176,8 +191,7 @@ export default function CameraPage() {
           {!isRunning ? (
             <button
               onClick={startCamera}
-              disabled={!isModelLoaded}
-              className="px-8 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 disabled:cursor-not-allowed rounded-lg font-semibold transition-colors"
+              className="px-8 py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition-colors"
             >
               📷 打開相機
             </button>
@@ -219,10 +233,26 @@ export default function CameraPage() {
         )}
 
         {/* 信息提示 */}
-        {!isModelLoaded && (
-          <div className="mt-8 p-4 bg-yellow-900/30 border border-yellow-600 rounded-lg">
-            <p className="text-yellow-300">
+        {modelStatus === '加載失敗' && (
+          <div className="mt-8 p-4 bg-red-900/30 border border-red-600 rounded-lg">
+            <p className="text-red-300">
+              ❌ 模型加載失敗。請檢查網路連接並點擊按鈕重試。
+            </p>
+          </div>
+        )}
+        
+        {modelStatus === '正在加載...' && (
+          <div className="mt-8 p-4 bg-blue-900/30 border border-blue-600 rounded-lg">
+            <p className="text-blue-300">
               ⏳ 模型正在加載中... 請稍候（首次加載可能需要 10-30 秒）
+            </p>
+          </div>
+        )}
+
+        {!isRunning && modelStatus === '已準備' && (
+          <div className="mt-8 p-4 bg-green-900/30 border border-green-600 rounded-lg">
+            <p className="text-green-300">
+              ✓ 模型已準備！點擊上方按鈕即可打開相機進行實時檢測。
             </p>
           </div>
         )}
