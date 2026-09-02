@@ -1,10 +1,21 @@
 'use client';
 
 import Link from 'next/link';
+import Image from 'next/image';
 import { useEffect, useRef, useState } from 'react';
 import { detectObjects, loadModel, type Detection } from '@/lib/yolo';
+import { generateObjectStory, type ObjectStory } from '@/lib/object-story';
 
 type ModelStatus = '載入中' | '已就緒' | '載入失敗';
+
+interface CapturedMoment {
+  url: string;
+  fileName: string;
+  width: number;
+  height: number;
+  detections: Detection[];
+  story: ObjectStory;
+}
 
 const CAMERA_MODEL_SIZE = 416;
 const UI_UPDATE_INTERVAL_MS = 200;
@@ -17,6 +28,8 @@ export default function CameraPage() {
   const [modelStatus, setModelStatus] = useState<ModelStatus>('載入中');
   const [detectorFps, setDetectorFps] = useState(0);
   const [errorMessage, setErrorMessage] = useState('');
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [capturedMoment, setCapturedMoment] = useState<CapturedMoment | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
@@ -26,6 +39,8 @@ export default function CameraPage() {
   const mountedRef = useRef(true);
   const fpsWindowRef = useRef({ startedAt: 0, frames: 0 });
   const lastUiUpdateRef = useRef(0);
+  const photoUrlRef = useRef<string | null>(null);
+  const inferencePromiseRef = useRef<Promise<Detection[]> | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -47,6 +62,7 @@ export default function CameraPage() {
       runningRef.current = false;
       if (detectionTimerRef.current !== null) window.clearTimeout(detectionTimerRef.current);
       streamRef.current?.getTracks().forEach((track) => track.stop());
+      if (photoUrlRef.current) URL.revokeObjectURL(photoUrlRef.current);
     };
   }, []);
 
@@ -128,7 +144,9 @@ export default function CameraPage() {
             overlay.height = video.videoHeight;
           }
 
-          const results = await detectObjects(video, 0.3, CAMERA_MODEL_SIZE);
+          const inference = detectObjects(video, 0.3, CAMERA_MODEL_SIZE);
+          inferencePromiseRef.current = inference;
+          const results = await inference;
           if (!runningRef.current || !mountedRef.current) return;
           drawDetections(overlay, results);
           const now = performance.now();
@@ -140,6 +158,8 @@ export default function CameraPage() {
         } catch (error) {
           console.error('物件辨識失敗：', error);
           if (mountedRef.current) setErrorMessage('推論時發生錯誤，請停止相機後再重新啟動。');
+        } finally {
+          inferencePromiseRef.current = null;
         }
       }
 
@@ -178,6 +198,68 @@ export default function CameraPage() {
     setIsDetecting(false);
     setDetections([]);
     setDetectorFps(0);
+  };
+
+  const capturePhoto = async () => {
+    const video = videoRef.current;
+    if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+
+    const shouldResumeDetection = runningRef.current;
+    runningRef.current = false;
+    if (detectionTimerRef.current !== null) {
+      window.clearTimeout(detectionTimerRef.current);
+      detectionTimerRef.current = null;
+    }
+    setIsCapturing(true);
+    setErrorMessage('');
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('無法建立拍照畫布');
+
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      if (inferencePromiseRef.current) {
+        await inferencePromiseRef.current.catch(() => undefined);
+      }
+      // Re-run the frozen photo at 640px for more accurate boxes and story material.
+      const snapshotDetections = await detectObjects(canvas, 0.3);
+      drawDetections(canvas, snapshotDetections, false);
+
+      const blob = await canvasToJpeg(canvas);
+      if (!mountedRef.current) return;
+      if (photoUrlRef.current) URL.revokeObjectURL(photoUrlRef.current);
+
+      const url = URL.createObjectURL(blob);
+      photoUrlRef.current = url;
+      const capturedAt = new Date().toISOString().replace(/[:.]/g, '-');
+      setCapturedMoment({
+        url,
+        fileName: `roadlens-${capturedAt}.jpg`,
+        width: canvas.width,
+        height: canvas.height,
+        detections: snapshotDetections,
+        story: generateObjectStory(snapshotDetections),
+      });
+    } catch (error) {
+      console.error('拍照失敗：', error);
+      setErrorMessage('拍照時發生錯誤，請確認相機仍在運作後再試一次。');
+    } finally {
+      if (mountedRef.current) {
+        setIsCapturing(false);
+        if (shouldResumeDetection && streamRef.current?.active) {
+          runningRef.current = true;
+          startDetectionLoop();
+        }
+      }
+    }
+  };
+
+  const clearCapturedMoment = () => {
+    if (photoUrlRef.current) URL.revokeObjectURL(photoUrlRef.current);
+    photoUrlRef.current = null;
+    setCapturedMoment(null);
   };
 
   return (
@@ -231,7 +313,7 @@ export default function CameraPage() {
           </div>
         )}
 
-        <div className="mt-5 flex justify-center">
+        <div className="mt-5 flex flex-wrap justify-center gap-3">
           {!isRunning ? (
             <button
               type="button"
@@ -242,13 +324,23 @@ export default function CameraPage() {
               {modelStatus === '載入中' ? '模型載入中…' : '啟動相機'}
             </button>
           ) : (
-            <button
-              type="button"
-              onClick={stopCamera}
-              className="min-w-48 rounded-xl bg-red-600 px-8 py-3 font-semibold transition hover:bg-red-500"
-            >
-              停止相機
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={capturePhoto}
+                disabled={isCapturing}
+                className="min-w-56 rounded-xl bg-amber-400 px-8 py-3 font-bold text-slate-950 transition hover:bg-amber-300 disabled:cursor-wait disabled:bg-slate-600 disabled:text-slate-300"
+              >
+                {isCapturing ? '正在拍照…' : '📸 拍照並創作故事'}
+              </button>
+              <button
+                type="button"
+                onClick={stopCamera}
+                className="min-w-40 rounded-xl bg-red-600 px-8 py-3 font-semibold transition hover:bg-red-500"
+              >
+                停止相機
+              </button>
+            </>
           )}
         </div>
 
@@ -279,6 +371,87 @@ export default function CameraPage() {
             )}
           </section>
         )}
+
+        {capturedMoment && (
+          <section className="mt-6 overflow-hidden rounded-2xl border border-amber-400/40 bg-gradient-to-br from-slate-900 to-amber-950/30 shadow-2xl">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-700 px-5 py-4">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-amber-400">RoadLens 相片故事</p>
+                <h2 className="mt-1 text-2xl font-bold text-white">{capturedMoment.story.title}</h2>
+              </div>
+              <div className="flex gap-2">
+                <a
+                  href={capturedMoment.url}
+                  download={capturedMoment.fileName}
+                  className="rounded-lg bg-amber-400 px-4 py-2 text-sm font-bold text-slate-950 transition hover:bg-amber-300"
+                >
+                  下載相片
+                </a>
+                <button
+                  type="button"
+                  onClick={clearCapturedMoment}
+                  className="rounded-lg border border-slate-600 px-4 py-2 text-sm text-slate-300 transition hover:bg-slate-800"
+                >
+                  關閉
+                </button>
+              </div>
+            </div>
+
+            <div className="grid gap-6 p-5 lg:grid-cols-[minmax(0,1.25fr)_minmax(320px,0.75fr)]">
+              <div className="overflow-hidden rounded-xl border border-slate-700 bg-black">
+                <Image
+                  src={capturedMoment.url}
+                  width={capturedMoment.width}
+                  height={capturedMoment.height}
+                  alt="包含物件辨識標記的相機快照"
+                  unoptimized
+                  className="h-auto w-full"
+                />
+              </div>
+
+              <div className="flex flex-col justify-center">
+                <div className="mb-5 flex flex-wrap gap-2">
+                  {capturedMoment.story.objects.length ? (
+                    capturedMoment.story.objects.map((object) => (
+                      <span
+                        key={object.classId}
+                        className="rounded-full border px-3 py-1 text-sm"
+                        style={{
+                          borderColor: getClassColor(object.classId),
+                          backgroundColor: getClassColor(object.classId, 0.14),
+                          color: getClassColor(object.classId),
+                        }}
+                      >
+                        {object.label} × {object.count}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="rounded-full border border-slate-600 px-3 py-1 text-sm text-slate-400">神祕物體 × 1</span>
+                  )}
+                </div>
+                <div className="space-y-4 text-base leading-8 text-slate-200">
+                  {capturedMoment.story.paragraphs.map((paragraph) => (
+                    <p key={paragraph}>{paragraph}</p>
+                  ))}
+                </div>
+                <div className="my-6 border-t border-slate-700" />
+                <div lang="en">
+                  <h3 className="mb-3 text-xl font-bold text-amber-200">
+                    {capturedMoment.story.titleEn}
+                  </h3>
+                  <div className="space-y-4 text-base leading-7 text-slate-300">
+                    {capturedMoment.story.paragraphsEn.map((paragraph) => (
+                      <p key={paragraph}>{paragraph}</p>
+                    ))}
+                  </div>
+                </div>
+                <p className="mt-5 text-xs text-slate-500">
+                  故事由照片中辨識到的 {capturedMoment.detections.length} 個物件即時創作。
+                </p>
+              </div>
+            </div>
+          </section>
+        )}
       </div>
     </main>
   );
@@ -293,11 +466,11 @@ function StatusPill({ label, value, good }: { label: string; value: string; good
   );
 }
 
-function drawDetections(canvas: HTMLCanvasElement, detections: Detection[]) {
+function drawDetections(canvas: HTMLCanvasElement, detections: Detection[], clearCanvas = true) {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (clearCanvas) ctx.clearRect(0, 0, canvas.width, canvas.height);
   const scale = Math.max(1, canvas.width / 1280);
   const lineWidth = 3 * scale;
   const fontSize = Math.round(16 * scale);
@@ -325,4 +498,14 @@ function getClassColor(classId: number, alpha = 1) {
   // The golden-angle step keeps all 80 COCO classes deterministic and visually separated.
   const hue = (classId * 137.508) % 360;
   return `hsla(${hue}, 85%, 60%, ${alpha})`;
+}
+
+function canvasToJpeg(canvas: HTMLCanvasElement) {
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => (blob ? resolve(blob) : reject(new Error('無法建立 JPEG 相片'))),
+      'image/jpeg',
+      0.92,
+    );
+  });
 }
