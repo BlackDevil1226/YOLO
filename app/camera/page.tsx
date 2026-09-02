@@ -58,13 +58,62 @@ export default function CameraPage() {
         
         // 視頻準備好後開始檢測
         videoRef.current.onloadedmetadata = () => {
-          startDetection();
+          // 使用 setTimeout 確保狀態已更新
+          setTimeout(() => {
+            startDetectionLoop();
+          }, 100);
         };
       }
     } catch (error) {
       console.error('相機訪問錯誤:', error);
       alert('無法訪問相機。請檢查權限設置。');
     }
+  };
+
+  const startDetectionLoop = () => {
+    const detect = async () => {
+      if (!videoRef.current || !canvasRef.current) {
+        return;
+      }
+
+      // 檢查視頻流是否仍在運行
+      if (!videoRef.current.srcObject) {
+        return;
+      }
+
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d');
+
+      if (!ctx) return;
+
+      try {
+        // 設置 canvas 大小
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+
+        // 繪製視頻幀
+        ctx.drawImage(video, 0, 0);
+
+        // 執行檢測
+        setIsDetecting(true);
+        const results = await detectObjects(canvas, 0.45);
+        setDetections(results);
+        setIsDetecting(false);
+
+        // 繪製檢測框
+        drawDetections(ctx, results, canvas.width, canvas.height);
+      } catch (error) {
+        console.error('檢測循環錯誤:', error);
+      }
+
+      // 繼續檢測
+      if (videoRef.current && videoRef.current.srcObject) {
+        animationFrameRef.current = requestAnimationFrame(detect);
+      }
+    };
+
+    detect();
   };
 
   const stopCamera = () => {
@@ -76,41 +125,6 @@ export default function CameraPage() {
         cancelAnimationFrame(animationFrameRef.current);
       }
     }
-  };
-
-  const startDetection = () => {
-    const detect = async () => {
-      if (!videoRef.current || !canvasRef.current || !isModelLoaded) return;
-
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext('2d');
-
-      if (!ctx) return;
-
-      // 設置 canvas 大小
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-
-      // 繪製視頻幀
-      ctx.drawImage(video, 0, 0);
-
-      // 執行檢測
-      setIsDetecting(true);
-      const results = await detectObjects(canvas, 0.45);
-      setDetections(results);
-      setIsDetecting(false);
-
-      // 繪製檢測框
-      drawDetections(ctx, results, canvas.width, canvas.height);
-
-      // 繼續檢測
-      if (isRunning) {
-        animationFrameRef.current = requestAnimationFrame(detect);
-      }
-    };
-
-    detect();
   };
 
   const drawDetections = (
@@ -174,13 +188,13 @@ export default function CameraPage() {
         />
 
         {/* Canvas（顯示檢測結果） */}
-        <div className="bg-black rounded-lg overflow-hidden shadow-xl mb-8">
+        <div className="relative bg-black rounded-lg overflow-hidden shadow-xl mb-8">
           <canvas
             ref={canvasRef}
             className="w-full aspect-video bg-black"
           />
           {!isRunning && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/50">
+            <div className="absolute inset-0 flex items-center justify-center bg-black/50 pointer-events-none">
               <p className="text-slate-300">點擊下方按鈕啟動相機</p>
             </div>
           )}
@@ -190,15 +204,17 @@ export default function CameraPage() {
         <div className="flex gap-4 justify-center mb-8">
           {!isRunning ? (
             <button
+              type="button"
               onClick={startCamera}
-              className="px-8 py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition-colors"
+              className="px-8 py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition-colors cursor-pointer"
             >
               📷 打開相機
             </button>
           ) : (
             <button
+              type="button"
               onClick={stopCamera}
-              className="px-8 py-3 bg-red-600 hover:bg-red-700 rounded-lg font-semibold transition-colors"
+              className="px-8 py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg transition-colors cursor-pointer"
             >
               ⏹️ 關閉相機
             </button>
